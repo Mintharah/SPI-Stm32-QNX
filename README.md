@@ -249,3 +249,163 @@ STM-side counters (`g_cmd_seen`, `g_cmd_ok`, `g_cmd_nack`, `g_adc_cb`,
 `g_imu_reads`, `g_imu_errs`, `g_rpm_caps`, `g_obr`, `g_arm_ok`, `g_sent`)
 are declared volatile and can be read via a debugger, printed over SWO,
 or piggybacked into a spare header slot for wire visibility.
+
+## SPI Troubleshooting — Frame Drops & Error Recovery
+
+Under high SPI clock rates frames were dropped. The controller logs these
+error counters:
+
+| Counter | Meaning |
+|---------|---------|
+| `magic` | Invalid frame magic header |
+| `ver`   | Protocol version mismatch |
+| `size`  | Frame size mismatch |
+| `dup`   | Duplicate frame (same sequence number) |
+| `rst`   | Frame with reset flag set |
+| `crc`   | CRC mismatch |
+| `spi`   | SPI bus read failure (devctl error) |
+| `to`    | Data-ready wait timeout |
+
+Initial state at 21 MHz: ~70% frame loss. After all fixes, **zero drops**
+at 14.7 MHz actual (15 MHz requested).
+
+### Fixes Applied
+
+#### 1. DR Assert Delay (STM32: `motor_send.c`)
+
+The Data-Ready GPIO (PB0) was asserted too quickly after DMA completed,
+before the slave TX/RX registers settled.
+
+```
+MOTOR_DR_ASSERT_DELAY_CYCLES: 8 → 1000
+```
+
+A 1000-cycle busy-wait (`spin_cycles()`) between `HAL_SPI_TransmitReceive_DMA`
+and DR assertion gives the SPI peripheral time to stabilise.
+
+#### 2. ARM_TX Retry Loop with CS Wait (STM32: `motor_send.c`)
+
+`arm_tx()` retries up to 50 times:
+- **CS wait**: after each failed attempt, spin until NSS (PB12) goes high
+  (master de-asserts CS) before retrying
+- **OVR/FRE clearing on every attempt** — stale overrun/frame-error flags
+  from a previous failure are cleared unconditionally at the top of the
+  retry loop, not only after attempt 0
+- **Longer BUSY_TX_RX timeout**: 5000-cycle spin waiting for SPI state
+  to enter BUSY_TX_RX before declaring the arm successful
+
+#### 3. ErrorCallback — No Re-Arm (STM32: `motor_send.c`)
+
+`HAL_SPI_ErrorCallback()` was re-arming DMA internally, producing duplicate
+frames (same seq) that inflated the `dup` counter and caused the next valid
+frame to be skipped:
+
+```
+// Old: HAL_SPI_Abort() + arm_tx() → duplicate frame
+// New: HAL_SPI_DMAStop() only, s_tx_idx = -1, no re-arm
+```
+
+- `HAL_SPI_Abort` → `HAL_SPI_DMAStop` (gentler, no SPE toggle)
+- No `arm_tx()` call — the normal completion path handles re-arm
+- `s_tx_idx = -1` so the state machine sees a clean slot
+
+#### 4. OVR/FRE Clear on Every Attempt (STM32: `motor_send.c`)
+
+Overrun (OVR) and frame-error (FRE) flags in `SPI2->SR` persist across
+`DMAStop` (unlike the old `DeInit` path which toggled SPE and cleared
+everything). Arm now clears them unconditionally:
+
+```c
+// OVR: read DR + SR to clear
+if (s_hspi2.Instance->SR & SPI_SR_OVR) {
+    volatile uint32_t tmp  = s_hspi2.Instance->DR;
+    tmp = s_hspi2.Instance->SR;
+    (void)tmp;
+}
+// FRE: toggle SPE
+if (s_hspi2.Instance->SR & SPI_SR_FRE) {
+    s_hspi2.Instance->CR1 &= ~SPI_CR1_SPE;
+    s_hspi2.Instance->CR1 |=  SPI_CR1_SPE;
+}
+```
+
+#### 5. Frame Validation Flag (QNX: `motor_controller.c`)
+
+Old code used `continue` on bad magic/CRC, skipping the rate-limiter and
+busy-looping. New code sets a `frame_valid` flag so the rate limiter always
+runs — bad frames are silently rejected but loop timing stays consistent.
+
+#### 6. SPI Clock Tuning (QNX: `config.json`)
+
+Iterative tuning to find maximum reliable frequency:
+
+| Attempt | Requested | Actual  | Drops |
+|---------|-----------|---------|-------|
+| 1       | 21 MHz    | ~21 MHz | ~70%  |
+| 2       | 1 MHz     | ~1 MHz  | 0     |
+| 3       | 21 MHz    | ~21 MHz | unstable |
+| 4       | 10 MHz    | ~10 MHz | moderate |
+| 5       | **15 MHz** | **14.7 MHz** | **0** |
+
+Final: `spi_clock_hz: 15000000` → actual SPI clock = **14.7 MHz**.
+
+#### 7. SPI Config Path (QNX: `config.c`)
+
+Changed from `/system/etc/spi.conf` (read-only on QNX guest) to `/var/spi.conf`
+(writable). Added `ensure_parent_dir()` and `rewrite_spi_conf()` creates the
+file from scratch if it does not exist.
+
+#### 8. SPI Apply Config at Startup (QNX: `motor_controller.c`)
+
+`spi_apply_conf()` is called at startup before `open_spi()` so the driver
+clock matches the JSON config before any reads begin. The runtime reload
+path skips `spi_apply_conf` to avoid bouncing the spi-dwc driver during
+operation.
+
+#### 9. CPU Affinity (QNX: `config.c`, `config.json`, `motor_controller.c`)
+
+Added `cpu_affinity` config option (range -1..7). When ≥ 0, the controller
+thread is pinned via `ThreadCtl(_NTO_TCTL_RUNMASK)`. Default: -1 (no pin).
+
+#### 10. SPI Error Recovery (QNX: `motor_controller.c`)
+
+After 3 consecutive `rpi_spi_write_read_data` failures the bus is
+automatically reopened:
+
+```c
+if (++bad_read_count >= 3) {
+    close_spi(&spi);
+    nanosleep(&ns_100ms, NULL);
+    open_spi(&spi, &cfg.pi);
+    bad_read_count = 0;
+    have_last = 0;   // reset sequence baseline
+}
+```
+
+#### 11. Per-Row Timestamps (QNX: `motor_shm.h`)
+
+Added `uint64_t row_ts[MOTOR_MAX_ROWS_PER_BLOCK]` to `shm_block_t` for
+precise per-row latency measurement. Filled by `motor_ring_publish()` using
+`hdr->timestamp + i * (1,000,000 / sample_rate_hz)`.
+
+#### 12. Timing Instrumentation (QNX: `motor_controller.c`)
+
+Per-second averaged timing diagnostics printed in the status log:
+
+| Metric | Description |
+|--------|-------------|
+| `wait` | Data-ready wait time (avg/max us) |
+| `spi`  | SPI transfer time (avg/max us) |
+| `pub`  | SHM publish time (avg/max us) |
+| `bad`  | Consecutive SPI devctl failures |
+
+### Final Result
+
+| Metric | Value |
+|--------|-------|
+| SPI clock | **14.7 MHz** (15 MHz requested) |
+| Frame size | 4828 bytes |
+| Test duration | 3090 frames |
+| **Total drops** | **0** |
+| Error counters | All zero |
+| Transient glitch | 1× `rst=1` in separate 47k-frame test (root cause unknown) |

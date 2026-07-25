@@ -49,7 +49,7 @@ extern void Error_Handler(void);
 #define DR_PIN             GPIO_PIN_0
 
 #ifndef MOTOR_DR_ASSERT_DELAY_CYCLES
-#define MOTOR_DR_ASSERT_DELAY_CYCLES  8u
+#define MOTOR_DR_ASSERT_DELAY_CYCLES  1000u
 #endif
 
 /* ---- diagnostic counters (read by main.c) -------------------------------- */
@@ -162,6 +162,10 @@ static void assemble_frame(uint8_t *buf, const motor_row_t *rows_in, uint16_t n_
         memset(buf + total, 0, MOTOR_MAX_FRAME_BYTES - total);
 }
 
+/* ---- forward declarations (defined after arm_tx but called from it on retry) */
+static void spi_init(void);
+static void dma_init(void);
+
 /* ---- transmit ------------------------------------------------------------ */
 static void spin_cycles(uint32_t n)
 {
@@ -172,37 +176,62 @@ static void spin_cycles(uint32_t n)
 static void arm_tx(int idx)
 {
     g_arm_called++;
-    s_tx_idx = idx;
-    /* Always clock MOTOR_MAX_FRAME_BYTES per transfer. The Pi is the master
-     * and clocks MAX regardless of block_rows, so we must match it or every
-     * Pi-side transfer consumes parts of the NEXT frame and looks like a
-     * massive seq-drop. The actual frame length is carried in h->n_rows; the
-     * trailing slack region is zero (cleared by assemble_frame).            */
-    if (HAL_SPI_TransmitReceive_DMA(&s_hspi2, s_frame[idx], s_rx_dummy,
-                                    MOTOR_MAX_FRAME_BYTES) != HAL_OK) {
-        s_tx_idx = -1;
-        s_skipped++;
-        g_arm_fail++;
+
+    for (int attempt = 0; attempt < 50; attempt++) {
+        if (attempt > 0) {
+            HAL_SPI_DMAStop(&s_hspi2);
+
+            uint32_t cs_wait = 50000u;
+            while ((GPIOB->IDR & GPIO_PIN_12) == 0u && --cs_wait) {
+                __NOP();
+            }
+        }
+
+        /* Clear stale OVR/FRE on EVERY attempt. DMAStop (used instead of
+         * the old HAL_SPI_DeInit/Abort path) does NOT clear these flags;
+         * leaving them set causes the error interrupt to re-fire
+         * immediately after ErrorCallback → arm_tx, locking the STM32 in
+         * an infinite error loop. The old DeInit path toggled SPE which
+         * cleared all flags as a side-effect, hiding this bug.           */
+        if (s_hspi2.Instance->SR & SPI_SR_OVR) {
+            volatile uint32_t tmp  = s_hspi2.Instance->DR;
+            tmp = s_hspi2.Instance->SR;
+            (void)tmp;
+        }
+        if (s_hspi2.Instance->SR & SPI_SR_FRE) {
+            s_hspi2.Instance->CR1 &= ~SPI_CR1_SPE;
+            s_hspi2.Instance->CR1 |=  SPI_CR1_SPE;
+        }
+
+        s_tx_idx = idx;
+
+        if (HAL_SPI_TransmitReceive_DMA(&s_hspi2, s_frame[idx], s_rx_dummy,
+                                        MOTOR_MAX_FRAME_BYTES) != HAL_OK) {
+            s_tx_idx = -1;
+            continue;
+        }
+
+        spin_cycles(MOTOR_DR_ASSERT_DELAY_CYCLES);
+
+        uint32_t timeout = 5000u;
+        while (HAL_SPI_GetState(&s_hspi2) != HAL_SPI_STATE_BUSY_TX_RX
+               && --timeout) {
+            __NOP();
+        }
+        if (timeout == 0u) {
+            HAL_SPI_DMAStop(&s_hspi2);
+            s_tx_idx = -1;
+            continue;
+        }
+
+        g_arm_ok++;
+        HAL_GPIO_WritePin(DR_PORT, DR_PIN, GPIO_PIN_SET);
+        spin_cycles(50u);
         return;
     }
 
-    spin_cycles(MOTOR_DR_ASSERT_DELAY_CYCLES);
-
-    uint32_t timeout = 1000u;
-    while (HAL_SPI_GetState(&s_hspi2) != HAL_SPI_STATE_BUSY_TX_RX
-           && --timeout) {
-        __NOP();
-    }
-    if (timeout == 0u) {
-        HAL_SPI_DMAStop(&s_hspi2);
-        s_tx_idx = -1;
-        s_skipped++;
-        g_arm_fail++;
-        return;
-    }
-
-    g_arm_ok++;
-    HAL_GPIO_WritePin(DR_PORT, DR_PIN, GPIO_PIN_SET);
+    s_skipped++;
+    g_arm_fail++;
 }
 
 /* ---- command processing ------------------------------------------------- */
@@ -399,11 +428,16 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)
     g_spi_err++;
 
     HAL_GPIO_WritePin(DR_PORT, DR_PIN, GPIO_PIN_RESET);
-    HAL_SPI_Abort(&s_hspi2);
 
-    int idx = (s_tx_idx >= 0) ? s_tx_idx : 0;
-    s_pending = 0;
-    arm_tx(idx);
+    /* Stop DMA but keep the peripheral enabled so the master can finish
+     * the current frame without getting a FRE.  Do NOT re-arm here:
+     * re-arming the same buffer creates a duplicate frame (same seq)
+     * which wastes the controller's time and causes the next valid frame
+     * to be skipped, inflating the drop count.  Instead, let the
+     * completion callback or the next capture-completion handle re-arm
+     * naturally via the normal s_tx_idx / s_pending state machine.       */
+    HAL_SPI_DMAStop(&s_hspi2);
+    s_tx_idx = -1;
 }
 
 /* ---- init ---------------------------------------------------------------- */
