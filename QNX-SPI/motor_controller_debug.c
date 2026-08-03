@@ -94,7 +94,7 @@ static const controller_config_t DEFAULT_CFG = {
     .sample_rate_hz = 20000u,
     .period_ns      = 10L * 1000L * 1000L,
     .rt_priority    = 30,
-    .dataready_pin = 17,
+    .dataready_pin = 27,
 };
 
 /* ============================ diagnostics ================================= */

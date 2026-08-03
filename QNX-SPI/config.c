@@ -41,7 +41,7 @@ const full_config_t CONFIG_DEFAULTS = {
         .spi_idle_insert = 0,
         .rt_priority     = 30,
         .cpu_affinity    = -1,    /* default: no pinning */
-        .dataready_pin   = 17,
+        .dataready_pin   = 27,
         .current_scale   = 1.0f,  .current_offset = 0.0f,
         .vib_scale       = 1.0f,  .vib_offset     = 0.0f,
         .rpm_scale       = 1.0f,  .rpm_offset     = 0.0f,

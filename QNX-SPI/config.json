@@ -9,7 +9,7 @@
     "spi_idle_insert": 0,
     "rt_priority": 30,
     "cpu_affinity": 0,
-    "dataready_pin": 17,
+    "dataready_pin": 27,
     "scaling": {
       "current_scale":  1.0,
       "current_offset": 0.0,
