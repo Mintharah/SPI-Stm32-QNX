@@ -1,5 +1,5 @@
-QT6_DIR := ../../QT/qt6-qnx-libs/output_dir
 QNX800_DIR := ../../../qnx800
+TOOLCHAIN_FILE := $(CURDIR)/qnxtoolchain.cmake
 
 .PHONY: all qnx clean
 
@@ -11,9 +11,12 @@ qnx:
 		[ -n "$$QNX_HOST" ] || . "$(QNX800_DIR)/qnxsdp-env.sh"; \
 		cmake -S . -B build_qnx \
 			-DCMAKE_BUILD_TYPE=Release \
-			-DCMAKE_TOOLCHAIN_FILE=$(QT6_DIR)/lib/cmake/Qt6/qt.toolchain.cmake \
-			-DQNX_LIB_DIR=$(QNX800_DIR)/target/qnx/aarch64le; \
+			-DCMAKE_TOOLCHAIN_FILE=$(TOOLCHAIN_FILE) \
+			-DCMAKE_SYSTEM_PROCESSOR=aarch64; \
 		cmake --build build_qnx'
+
+clean:
+	rm -rf build_qnx
 
 clean:
 	rm -rf build_qnx
