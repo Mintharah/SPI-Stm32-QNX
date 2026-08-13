@@ -1,0 +1,5 @@
+# PlatformIO build output
+.pio/
+
+# Locally built binaries (see firmware/FLASH.txt)
+firmware/

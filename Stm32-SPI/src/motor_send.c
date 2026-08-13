@@ -368,10 +368,95 @@ static void process_pending_cmd(void)
     }
 }
 
+/* ---- stalled-transfer recovery ------------------------------------------
+ *
+ * Once arm_tx() succeeds the state machine has exactly one way out: the
+ * master finishes clocking MOTOR_MAX_FRAME_BYTES, TxRxCplt fires, PB0 drops
+ * and the next frame is armed. If those clocks never arrive, nothing here
+ * ever runs again:
+ *
+ *   - TxRxCplt cannot fire, because the DMA never completes.
+ *   - ErrorCallback cannot fire either -- an abandoned transfer produces no
+ *     OVR/FRE, it just sits there.
+ *   - s_tx_idx stays >= 0 forever, so every later motor_on_block_ready takes
+ *     the `else` branch, sets s_pending and returns.
+ *   - PB0 stays HIGH forever.
+ *
+ * That is a permanent deadlock, and it survives anything done on the Pi side:
+ * the master sees data-ready asserted, reads a frame the slave is not
+ * driving, gets garbage, and repeats. Only a reset of THIS board clears it,
+ * which is why it looks like a Pi problem and is not one.
+ *
+ * The master abandoning a transfer mid-frame is routine, not exotic -- the
+ * producer being restarted, spi-dwc being bounced (which motor_controller
+ * does by itself on an SPI-tier config reload), or the Pi rebooting all leave
+ * the slave part-way through a frame.
+ *
+ * So: if a transfer has been in flight for TX_STALL_BLOCKS block periods,
+ * tear it down and re-arm on the next block. At the default 20 kHz / 200 rows
+ * a block is 10 ms, so the budget below is ~1 s -- far longer than any real
+ * transfer (a 4828-byte frame is ~5 ms at 8 MHz, and tens of ms even on a
+ * badly misconfigured bus), and short enough that the link recovers on its
+ * own a second after the master comes back.
+ */
+#ifndef TX_STALL_BLOCKS
+#define TX_STALL_BLOCKS  100u
+#endif
+
+volatile uint32_t g_tx_stall = 0;      /* stalled transfers recovered */
+
+static uint32_t s_inflight_blocks = 0; /* blocks elapsed with a tx in flight */
+
+static void tx_recover(void)
+{
+    g_tx_stall++;
+
+    /* Drop data-ready first: the master must stop starting new reads against
+     * a slave that is about to be torn down. */
+    HAL_GPIO_WritePin(DR_PORT, DR_PIN, GPIO_PIN_RESET);
+
+    HAL_SPI_DMAStop(&s_hspi2);
+
+    /* Re-arming while the master still holds CS asserted would splice us into
+     * the middle of its current frame. Wait for the bus to go idle, bounded so
+     * a CS stuck low cannot hang the ISR this runs from. */
+    uint32_t cs_wait = 50000u;
+    while ((GPIOB->IDR & GPIO_PIN_12) == 0u && --cs_wait) {
+        __NOP();
+    }
+
+    /* An aborted transfer leaves OVR/FRE latched, and DMAStop does not clear
+     * them -- same trap arm_tx() documents on its retry path. Left set, the
+     * error interrupt re-fires the instant we re-enable. */
+    if (s_hspi2.Instance->SR & SPI_SR_OVR) {
+        volatile uint32_t tmp = s_hspi2.Instance->DR;
+        tmp = s_hspi2.Instance->SR;
+        (void)tmp;
+    }
+    if (s_hspi2.Instance->SR & SPI_SR_FRE) {
+        s_hspi2.Instance->CR1 &= ~SPI_CR1_SPE;
+        s_hspi2.Instance->CR1 |=  SPI_CR1_SPE;
+    }
+
+    s_tx_idx          = -1;
+    s_pending         = 0;
+    s_inflight_blocks = 0;
+}
+
 /* ---- the producer hook --------------------------------------------------- */
 void motor_on_block_ready(const motor_row_t *rows, uint16_t n_rows)
 {
     g_obr++;
+
+    /* Watchdog the in-flight transfer before anything else, so a stalled one
+     * is cleared in time for this block to be armed normally below. */
+    if (s_tx_idx >= 0) {
+        if (++s_inflight_blocks >= TX_STALL_BLOCKS)
+            tx_recover();
+    } else {
+        s_inflight_blocks = 0;
+    }
+
     int inflight = s_tx_idx;
     int build    = (inflight == 0) ? 1 : 0;
 
@@ -399,6 +484,11 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
     HAL_GPIO_WritePin(DR_PORT, DR_PIN, GPIO_PIN_RESET);
     s_sent++;
     g_sent++;
+
+    /* A frame completed, so whatever is armed next starts its stall budget
+     * from zero. Without this the counter carries over between transfers and
+     * eventually trips tx_recover() on a perfectly healthy link. */
+    s_inflight_blocks = 0;
 
     /* Sniff the rx for a command frame. Cheap: just compare 4 bytes. The
      * full validation (CRC, ranges) happens at the next block boundary in
@@ -438,6 +528,7 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)
      * naturally via the normal s_tx_idx / s_pending state machine.       */
     HAL_SPI_DMAStop(&s_hspi2);
     s_tx_idx = -1;
+    s_inflight_blocks = 0;   /* transfer is over; next one starts fresh */
 }
 
 /* ---- init ---------------------------------------------------------------- */
