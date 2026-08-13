@@ -156,9 +156,11 @@ static void t_double_buffer(void)
     CHECK(fh_armed_buf == first, "in-flight buffer was re-armed under the transfer");
     CHECK(s_pending == 1, "second block not marked pending");
     complete_transfer();
-    /* A block was pending, so the completion callback re-arms it right away. */
-    CHECK(fh_dma_armed == 1, "pending block was not re-armed on completion");
-    CHECK(fh_dr_level == 1, "DR not raised for the re-armed block");
+    /* A block was pending, so it is re-armed at once -- the slave is never left
+     * unarmed. Data-ready dips and comes back, which is the edge the Pi waits
+     * on even though a 1 ms poll could not see it. */
+    CHECK(fh_dma_armed == 1, "pending block was not re-armed");
+    CHECK(fh_dr_level == 1, "data-ready not raised for the re-armed block");
     /* Reusing the buffer that was just transmitted is fine -- the transfer is
      * complete and nothing is reading it. The property that matters is that a
      * block is never assembled into the buffer currently IN FLIGHT. */

@@ -531,25 +531,31 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
      */
     HAL_SPI_DMAStop(&s_hspi2);
 
-    /* Re-arm immediately when a block is waiting.
+    /* Re-arm immediately, so the slave is ALWAYS armed.
      *
-     * Not re-arming was tried, to give the Pi a clean low->high edge per frame
-     * instead of a data-ready line that barely dips between transfers. It did
-     * cut bad frames (10/s -> 3/s) but cost more than it bought, because the
-     * pending block is then discarded rather than sent:
+     * This pairs with the Pi waiting on the rising edge rather than polling the
+     * level (see dataready_wait). Two separate things were going wrong and each
+     * needs its own half of the fix:
      *
-     *     re-arm:      ok 91/s   drops  0/s   magic 10/s
-     *     no re-arm:   ok 85/s   drops 11/s   magic  3/s
+     *   - the master could not tell one frame from the next, because the line
+     *     only dipped for the ~150 us of the re-arm and a 1 ms poll never saw
+     *     it. The EDGE fixes that; the dip is plenty for the GPIO resource
+     *     manager's edge detector even though it is invisible to a poll.
      *
-     * Six good blocks a second is a worse trade than seven bad reads, so the
-     * re-arm stays. Recorded here so it is not re-attempted blind. */
+     *   - a read that started before the arm completed got stale bytes. Keeping
+     *     the slave armed at all times fixes that: there is no window in which
+     *     a transfer can begin against an unarmed DMA.
+     *
+     * Measured, not re-arming (with the Pi on edges) drove magic to 2 total and
+     * held it there -- the diagnosis was right -- but cost throughput badly,
+     * ok 32/s against 100 blocks/s produced, because the pending block is
+     * discarded. Re-arming keeps the blocks. */
     if (s_pending) {
         s_pending = 0;
         arm_tx((just == 0) ? 1 : 0);
     } else {
         s_tx_idx = -1;
     }
-
 }
 
 /* Which error, specifically. g_spi_err alone says ~41/s are happening but not
