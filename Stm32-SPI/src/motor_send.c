@@ -512,10 +512,31 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
     }
 }
 
+/* Which error, specifically. g_spi_err alone says ~41/s are happening but not
+ * what they are, and the two likely causes want opposite fixes:
+ *   OVR -- the master clocked us while no DMA was armed (a read that landed in
+ *          the gap between TxRxCplt and the next arm_tx, or on a stale-high
+ *          data-ready). Timing problem.
+ *   FRE -- NSS moved mid-frame. With SPI_NSS_HARD_INPUT that means the master
+ *          deasserted chip-select part way through. Wiring or driver problem.
+ * Diagnostic only; no behaviour change. */
+volatile uint32_t g_err_ovr = 0, g_err_fre = 0, g_err_modf = 0,
+                  g_err_dma = 0, g_err_other = 0;
+
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)
 {
     if (h->Instance != SPI2) return;
     g_spi_err++;
+
+    {
+        uint32_t e = h->ErrorCode;
+        if (e & HAL_SPI_ERROR_OVR)  g_err_ovr++;
+        if (e & HAL_SPI_ERROR_FRE)  g_err_fre++;
+        if (e & HAL_SPI_ERROR_MODF) g_err_modf++;
+        if (e & HAL_SPI_ERROR_DMA)  g_err_dma++;
+        if (!(e & (HAL_SPI_ERROR_OVR | HAL_SPI_ERROR_FRE |
+                   HAL_SPI_ERROR_MODF | HAL_SPI_ERROR_DMA))) g_err_other++;
+    }
 
     HAL_GPIO_WritePin(DR_PORT, DR_PIN, GPIO_PIN_RESET);
 
