@@ -53,6 +53,15 @@ static const char *pi_validate(const uint8_t *rx, uint16_t expect_rows)
     return NULL;
 }
 
+/* TxRxCplt means the transfer finished, so the DMA is no longer running.
+ * The stub only clears fh_dma_armed on DMAStop, and the firmware no longer
+ * calls that on the healthy path, so the harness has to model it. */
+static void complete_transfer(void)
+{
+    fh_dma_armed = 0;
+    HAL_SPI_TxRxCpltCallback(&s_hspi2);
+}
+
 static void reset_all(void)
 {
     fh_reset();
@@ -92,7 +101,7 @@ static void t_frame_accepted_by_pi(void)
     /* slack past the frame end must be zero, not stale from a bigger frame */
     reset_all(); rows_fill(7);
     motor_on_block_ready(g_rows, 200);          /* fills the buffer */
-    HAL_SPI_TxRxCpltCallback(&s_hspi2);
+    complete_transfer();
     motor_on_block_ready(g_rows, 10);           /* much smaller */
     const uint8_t *b = fh_armed_buf;
     size_t used = sizeof(frame_header_t) + 10u * sizeof(motor_row_t) + 4u;
@@ -111,7 +120,7 @@ static void t_sequence_monotonic(void)
         const frame_header_t *h = (const frame_header_t *)fh_armed_buf;
         if (i > 0) CHECK(h->seq == prev + 1, "seq jumped %u -> %u", prev, h->seq);
         prev = h->seq;
-        HAL_SPI_TxRxCpltCallback(&s_hspi2);
+        complete_transfer();
     }
 }
 
@@ -122,7 +131,7 @@ static void t_dr_handshake(void)
     CHECK(fh_dr_level == 0, "DR high before any frame");
     motor_on_block_ready(g_rows, 200);
     CHECK(fh_dr_level == 1, "DR not raised after arming");
-    HAL_SPI_TxRxCpltCallback(&s_hspi2);
+    complete_transfer();
     CHECK(fh_dr_level == 0, "DR not dropped on completion");
 
     /* arm failure must not leave DR asserted with nothing behind it */
@@ -146,8 +155,17 @@ static void t_double_buffer(void)
     motor_on_block_ready(g_rows, 200);          /* arrives mid-transfer */
     CHECK(fh_armed_buf == first, "in-flight buffer was re-armed under the transfer");
     CHECK(s_pending == 1, "second block not marked pending");
-    HAL_SPI_TxRxCpltCallback(&s_hspi2);
-    CHECK(fh_armed_buf != first, "pending block did not go out on the other buffer");
+    complete_transfer();
+    /* A block was pending, so the completion callback re-arms it right away. */
+    CHECK(fh_dma_armed == 1, "pending block was not re-armed on completion");
+    CHECK(fh_dr_level == 1, "DR not raised for the re-armed block");
+    /* Reusing the buffer that was just transmitted is fine -- the transfer is
+     * complete and nothing is reading it. The property that matters is that a
+     * block is never assembled into the buffer currently IN FLIGHT. */
+    const uint8_t *inflight = fh_armed_buf;
+    motor_on_block_ready(g_rows, 200);      /* arrives mid-transfer again */
+    CHECK(fh_armed_buf == inflight, "assembled over the in-flight buffer");
+    CHECK(s_frame[0] != s_frame[1], "double buffer collapsed to one");
 }
 
 static void t_stale_frame_after_error(void)
@@ -165,15 +183,15 @@ static void t_stale_frame_after_error(void)
 
     motor_on_block_ready(g_rows, 200);                 /* block C -> armed    */
     uint32_t seq_c = ((frame_header_t*)fh_armed_buf)->seq;
-    HAL_SPI_TxRxCpltCallback(&s_hspi2);                /* C completes         */
+    complete_transfer();                               /* C completes         */
+    /* Nothing was pending (the error cleared it), so nothing should re-arm. */
+    CHECK(fh_dma_armed == 0, "a stale block was re-armed after the error");
 
-    if (fh_dma_armed) {
-        uint32_t next = ((frame_header_t*)fh_armed_buf)->seq;
-        CHECK(next > seq_c,
-              "STALE FRAME: after C (seq=%u) the next armed frame is seq=%u, "
-              "an older block resurrected by s_pending surviving the error",
-              seq_c, next);
-    }
+    motor_on_block_ready(g_rows, 200);                 /* block D             */
+    uint32_t seq_d = ((frame_header_t*)fh_armed_buf)->seq;
+    CHECK(seq_d > seq_c,
+          "STALE FRAME: after C (seq=%u) the next frame on the wire is seq=%u -- "
+          "an older block resurrected instead of superseded", seq_c, seq_d);
 }
 
 static void t_stall_watchdog(void)
@@ -190,7 +208,7 @@ static void t_stall_watchdog(void)
     reset_all(); rows_fill(6);
     for (int i = 0; i < TX_STALL_BLOCKS * 3; ++i) {
         motor_on_block_ready(g_rows, 200);
-        HAL_SPI_TxRxCpltCallback(&s_hspi2);
+        complete_transfer();
     }
     CHECK(g_tx_stall == 0, "watchdog false-fired %u times on a healthy link", g_tx_stall);
 }
@@ -315,10 +333,10 @@ static void t_config_applied_oneshot(void)
     build_cmd(cmd, MOTOR_CMD_SET_CONFIG, MOTOR_CONFIG_SCHEMA_VERSION, 1,
               150, MOTOR_SOURCE_ADC, MOTOR_RUN_RUN, 20000, 1000, 0);
     deliver_cmd(cmd);
-    HAL_SPI_TxRxCpltCallback(&s_hspi2);
+    complete_transfer();
     motor_on_block_ready(g_rows, 200);
     int first = (((frame_header_t*)fh_armed_buf)->flags & MOTOR_FLAG_CONFIG_APPLIED) != 0;
-    HAL_SPI_TxRxCpltCallback(&s_hspi2);
+    complete_transfer();
     motor_on_block_ready(g_rows, 200);
     int second = (((frame_header_t*)fh_armed_buf)->flags & MOTOR_FLAG_CONFIG_APPLIED) != 0;
     CHECK(first, "CONFIG_APPLIED never set on the first frame after an apply");

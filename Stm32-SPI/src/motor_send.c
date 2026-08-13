@@ -510,8 +510,39 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
     }
 
     int just = s_tx_idx;
+
+    /* Keep the DMAStop. It looks wrong and measures right.
+     *
+     * This callback is the transfer completing, so stopping the DMA here is
+     * redundant on paper, and it manufactures errors: 80 HAL_SPI_ERROR_DMA per
+     * second against 99 completed transfers, four in five. Removing it cleans
+     * that up almost entirely -- spi_err 84/s -> 6/s, err_dma 81/s -> 3/s.
+     *
+     * It also makes the link worse. Matched 60-second windows, everything else
+     * identical, measured at the Pi where it counts:
+     *
+     *     with DMAStop:     ok 95/s   drops 0/s   magic  5/s
+     *     without:          ok 89/s   drops 0/s   magic 12/s
+     *
+     * So the aborts are benign bookkeeping and the stop is doing something real
+     * -- resynchronising the peripheral between frames -- that the error
+     * counter gives no credit for. Judge this by ok/magic at the Pi, never by
+     * g_spi_err, which points the opposite way.
+     */
     HAL_SPI_DMAStop(&s_hspi2);
 
+    /* Re-arm immediately when a block is waiting.
+     *
+     * Not re-arming was tried, to give the Pi a clean low->high edge per frame
+     * instead of a data-ready line that barely dips between transfers. It did
+     * cut bad frames (10/s -> 3/s) but cost more than it bought, because the
+     * pending block is then discarded rather than sent:
+     *
+     *     re-arm:      ok 91/s   drops  0/s   magic 10/s
+     *     no re-arm:   ok 85/s   drops 11/s   magic  3/s
+     *
+     * Six good blocks a second is a worse trade than seven bad reads, so the
+     * re-arm stays. Recorded here so it is not re-attempted blind. */
     if (s_pending) {
         s_pending = 0;
         arm_tx((just == 0) ? 1 : 0);

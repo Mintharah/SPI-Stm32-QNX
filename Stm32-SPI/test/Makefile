@@ -15,8 +15,12 @@ INCS     = -Ifakehal -I../src -I../include
 all: t
 	./t
 
-t: test_motor_send.c fakehal/fakehal.c fakehal/acq_stub.c
-	$(CC) $(CFLAGS) $(INCS) -o $@ $^
+# ../src/motor_send.c is a real dependency -- the test #includes it. Leaving it
+# out meant editing the firmware and re-running make silently retested the old
+# binary, which is worse than having no tests at all.
+t: test_motor_send.c fakehal/fakehal.c fakehal/acq_stub.c ../src/motor_send.c \
+   ../include/motor_wire.h fakehal/stm32f4xx_hal.h
+	$(CC) $(CFLAGS) $(INCS) -o $@ test_motor_send.c fakehal/fakehal.c fakehal/acq_stub.c
 
 clean:
 	rm -f t
