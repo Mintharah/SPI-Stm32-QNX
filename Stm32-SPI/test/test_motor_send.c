@@ -178,8 +178,13 @@ static void t_stale_frame_after_error(void)
     motor_on_block_ready(g_rows, 200);                 /* block B -> pending  */
     (void)seq_a;
 
+    /* A genuine failure leaves HAL out of BUSY_TX_RX -- that is what
+     * distinguishes it from the stale abort the completion path generates. */
+    fh_spi_state = HAL_SPI_STATE_READY;
+    fh_dma_armed = 0;
     s_hspi2.ErrorCode = HAL_SPI_ERROR_OVR;
     HAL_SPI_ErrorCallback(&s_hspi2);                   /* transfer dies       */
+    fh_spi_state = HAL_SPI_STATE_BUSY_TX_RX;           /* back to normal      */
 
     motor_on_block_ready(g_rows, 200);                 /* block C -> armed    */
     uint32_t seq_c = ((frame_header_t*)fh_armed_buf)->seq;
@@ -346,7 +351,7 @@ static void t_config_applied_oneshot(void)
 static void t_error_counters(void)
 {
     printf("SPI error classification\n");
-    reset_all();
+    reset_all();   /* not inside a completion, so errors are acted on */
     s_hspi2.ErrorCode = HAL_SPI_ERROR_OVR;  HAL_SPI_ErrorCallback(&s_hspi2);
     s_hspi2.ErrorCode = HAL_SPI_ERROR_FRE;  HAL_SPI_ErrorCallback(&s_hspi2);
     s_hspi2.ErrorCode = HAL_SPI_ERROR_DMA;  HAL_SPI_ErrorCallback(&s_hspi2);

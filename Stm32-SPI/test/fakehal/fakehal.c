@@ -4,13 +4,30 @@ SPI_Regs    g_spi2_regs   = {0};
 int fh_dr_level = 0, fh_dma_armed = 0, fh_arm_should_fail = 0, fh_dmastop_calls = 0;
 const uint8_t *fh_armed_buf = 0;
 HAL_SPI_StateTypeDef fh_spi_state = HAL_SPI_STATE_BUSY_TX_RX;
-void fh_reset(void){ fh_dr_level=0; fh_dma_armed=0; fh_armed_buf=0;
+void fh_reset(void){ fh_dmastop_raises_error=0; fh_dr_level=0; fh_dma_armed=0; fh_armed_buf=0;
     fh_arm_should_fail=0; fh_dmastop_calls=0; fh_spi_state=HAL_SPI_STATE_BUSY_TX_RX;
     g_gpiob_regs.IDR = GPIO_PIN_12; g_spi2_regs.SR = 0; }
 HAL_StatusTypeDef HAL_SPI_TransmitReceive_DMA(SPI_HandleTypeDef*h,uint8_t*tx,uint8_t*rx,uint16_t n){
     (void)h;(void)rx;(void)n; if(fh_arm_should_fail) return HAL_ERROR;
     fh_dma_armed=1; fh_armed_buf=tx; return HAL_OK; }
-HAL_StatusTypeDef HAL_SPI_DMAStop(SPI_HandleTypeDef*h){ (void)h; fh_dma_armed=0; fh_dmastop_calls++; return HAL_OK; }
+int fh_dmastop_raises_error = 0;
+extern void HAL_SPI_ErrorCallback(SPI_HandleTypeDef*);
+extern SPI_HandleTypeDef *fh_hspi;
+HAL_StatusTypeDef HAL_SPI_DMAStop(SPI_HandleTypeDef*h){
+    fh_dma_armed=0; fh_dmastop_calls++;
+    /* The real HAL delivers the abort's error callback synchronously from
+     * inside this call. That is the whole point of the s_in_cplt guard, so
+     * the stub has to reproduce it or the test proves nothing. */
+    /* Not re-entrant: the error handler itself calls DMAStop, and the real
+     * hardware does not raise a fresh abort error for that. */
+    static int in_raise = 0;
+    if (fh_dmastop_raises_error && !in_raise) {
+        in_raise = 1;
+        h->ErrorCode = HAL_SPI_ERROR_DMA;
+        HAL_SPI_ErrorCallback(h);
+        in_raise = 0;
+    }
+    return HAL_OK; }
 HAL_SPI_StateTypeDef HAL_SPI_GetState(SPI_HandleTypeDef*h){ (void)h; return fh_spi_state; }
 HAL_StatusTypeDef HAL_SPI_Init(SPI_HandleTypeDef*h){ (void)h; return HAL_OK; }
 HAL_StatusTypeDef HAL_DMA_Init(DMA_HandleTypeDef*h){ (void)h; return HAL_OK; }

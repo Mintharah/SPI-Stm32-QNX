@@ -82,7 +82,6 @@ static _Alignas(8) uint8_t s_rx_dummy[MOTOR_MAX_FRAME_BYTES];
 
 static volatile int s_tx_idx  = -1;
 static volatile int s_pending = 0;
-
 static volatile uint32_t s_sent    = 0;
 static volatile uint32_t s_skipped = 0;
 
@@ -489,6 +488,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
 {
     if (h->Instance != SPI2) return;
 
+
     HAL_GPIO_WritePin(DR_PORT, DR_PIN, GPIO_PIN_RESET);
     s_sent++;
     g_sent++;
@@ -549,6 +549,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
     } else {
         s_tx_idx = -1;
     }
+
 }
 
 /* Which error, specifically. g_spi_err alone says ~41/s are happening but not
@@ -561,6 +562,9 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
  * Diagnostic only; no behaviour change. */
 volatile uint32_t g_err_ovr = 0, g_err_fre = 0, g_err_modf = 0,
                   g_err_dma = 0, g_err_other = 0;
+volatile uint32_t g_err_idle    = 0;  /* arrived with nothing in flight       */
+volatile uint32_t g_err_live    = 0;  /* arrived with a transfer in flight    */
+
 
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)
 {
@@ -576,6 +580,40 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)
         if (!(e & (HAL_SPI_ERROR_OVR | HAL_SPI_ERROR_FRE |
                    HAL_SPI_ERROR_MODF | HAL_SPI_ERROR_DMA))) g_err_other++;
     }
+
+    /* Ignore an error that arrives while a transfer is armed and running.
+     *
+     * HAL_SPI_DMAStop() in the completion path aborts streams that are still
+     * retiring, and that abort surfaces here as HAL_SPI_ERROR_DMA -- about 80
+     * times a second, four transfers in five. By the time it lands, the
+     * completion callback has usually already armed the NEXT frame and raised
+     * data-ready. Tearing down at that point kills a perfectly healthy
+     * transfer, and if the master has already sampled data-ready high it then
+     * clocks into a slave with no DMA armed. That is the OVR in the counters
+     * and the bad magic the Pi reports: the error handler was causing the very
+     * fault it exists to recover from.
+     *
+     * If SPI is BUSY_TX_RX with a live s_tx_idx then the armed transfer is
+     * fine and this error belongs to the previous one. Drop it.
+     *
+     * It cannot mask a genuine stall: a transfer that really is wedged stops
+     * completing, and the TX_STALL_BLOCKS watchdog in motor_on_block_ready
+     * tears it down and re-arms within about a second. */
+    /* Nothing in flight, so there is nothing to recover -- and acting anyway
+     * does harm. The teardown below clears s_pending, so a stale error landing
+     * between transfers silently discards the block that was queued for the
+     * next one, and drops data-ready after the completion path has raised it.
+     * If the master has already sampled that line high it then clocks into a
+     * slave with no DMA armed, which is the OVR in the counters and the bad
+     * magic at the Pi.
+     *
+     * These are counted separately so the split is visible rather than
+     * assumed: g_err_idle vs g_err_live. */
+    if (s_tx_idx < 0) {
+        g_err_idle++;
+        return;
+    }
+    g_err_live++;
 
     HAL_GPIO_WritePin(DR_PORT, DR_PIN, GPIO_PIN_RESET);
 

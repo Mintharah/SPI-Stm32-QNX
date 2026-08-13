@@ -97,6 +97,7 @@ extern int      fh_dma_armed;       /* is a transfer armed */
 extern const uint8_t *fh_armed_buf; /* which buffer was armed */
 extern int      fh_arm_should_fail;
 extern int      fh_dmastop_calls;
+extern int      fh_dmastop_raises_error;
 extern HAL_SPI_StateTypeDef fh_spi_state;
 void fh_reset(void);
 
