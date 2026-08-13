@@ -287,8 +287,13 @@ static void t_set_config(void)
     build_cmd(cmd, MOTOR_CMD_SET_CONFIG, MOTOR_CONFIG_SCHEMA_VERSION, 42,
               100, MOTOR_SOURCE_ADC, MOTOR_RUN_RUN, 20000, 1000, 1 /* bad crc */);
     deliver_cmd(cmd);
-    CHECK(s_latched_cmd_seq == good_seq || (s_latched_ack_flags & MOTOR_FLAG_NACK_CRC),
-          "corrupt command silently retargeted the ACK");
+    /* Strict: the ACK target must still name the last GOOD command. A frame
+     * that fails its CRC tells us nothing, including who it is from, so it
+     * must not be able to move _reserved -- the Pi matches ACKs on that. */
+    CHECK(s_latched_cmd_seq == good_seq,
+          "corrupt command retargeted the ACK: %u -> %u (Pi matches on this)",
+          good_seq, s_latched_cmd_seq);
+    CHECK(s_latched_ack_flags & MOTOR_FLAG_NACK_CRC, "bad CRC not flagged");
 
     /* idempotent replay: same seq twice must re-ACK, not re-apply */
     reset_all(); rows_fill(8); motor_on_block_ready(g_rows, 200);

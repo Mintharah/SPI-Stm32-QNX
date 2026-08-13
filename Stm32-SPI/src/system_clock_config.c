@@ -27,6 +27,12 @@
  */
 #include "stm32f4xx_hal.h"
 
+/* Declared, not assumed. This file calls Error_Handler() and had no
+ * declaration in scope, so it linked only because the implicit-declaration
+ * signature happened to match the real one -- and it warned on every build.
+ * main.c defines it. */
+extern void Error_Handler(void);
+
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef osc = {0};

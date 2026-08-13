@@ -255,9 +255,12 @@ static void process_pending_cmd(void)
     /* Magic was already checked in the sniff, but re-check defensively. */
     if (ch->magic != MOTOR_CMD_MAGIC) return;
 
-    s_latched_cmd_seq = ch->cmd_seq;
-
-    /* CRC over [cmd_header_t][config_payload_t]. */
+    /* CRC over [cmd_header_t][config_payload_t]. Checked BEFORE latching the
+     * sequence number: cmd_seq comes out of the same frame the CRC is there to
+     * vouch for, so latching first meant a corrupted frame could retarget the
+     * ACK at a sequence number the Pi never sent, and the Pi matches ACKs by
+     * exactly that field. A frame that fails its CRC tells us nothing at all,
+     * including who it claims to be from. */
     size_t covered = sizeof(cmd_header_t) + sizeof(config_payload_t);
     uint32_t got;
     memcpy(&got, buf + covered, sizeof got);
@@ -266,6 +269,8 @@ static void process_pending_cmd(void)
         g_cmd_nack++;
         return;
     }
+
+    s_latched_cmd_seq = ch->cmd_seq;
 
     /* Schema version. We only support exactly the compiled-in version for
      * now; older fw declines newer schemas instead of misinterpreting.   */

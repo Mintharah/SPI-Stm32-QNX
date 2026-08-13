@@ -58,7 +58,14 @@ extern void Error_Handler(void);
 #define N_CURRENT_CH                    8u   /* PA0..PA7 (ADC1 IN0..IN7)         */
 
 /* MPU6050 addressing and register map. AD0 low -> 0x68.                       */
-#define MPU6050_ADDR_8       (0x68u << 1)
+#define MPU6050_ADDR_8       (0x68u << 1)   /* AD0 low  */
+#define MPU6050_ADDR_8_ALT   (0x69u << 1)   /* AD0 high or floating */
+
+/* How often to re-probe for an absent IMU, in TIM2 ticks. At the default
+ * 1 kHz that is once a second -- cheap, and it means an MPU that is late to
+ * power up, or reconnected while running, is picked up instead of being
+ * written off at boot. */
+#define IMU_REPROBE_TICKS    1000u
 #define MPU_REG_SMPLRT       0x19u
 #define MPU_REG_CONFIG       0x1Au
 #define MPU_REG_GYRO_CFG     0x1Bu
@@ -91,13 +98,27 @@ static volatile int16_t  s_vib_z = 0;
 static volatile uint16_t s_rpm   = 0;
 static volatile uint32_t s_last_capture = 0;
 static volatile uint8_t  s_capture_seen = 0;
+static volatile uint32_t s_rpm_last_ms  = 0;
+
+/* Report 0 rather than a stale reading once the tach goes quiet.
+ *
+ * s_rpm was only ever assigned inside the capture interrupt, so when the shaft
+ * stopped the last measured value stayed in every row forever -- a stopped
+ * motor published its old running speed indefinitely.
+ *
+ * 200 ms is comfortably longer than the slowest period the 16-bit 1 MHz counter
+ * can even represent (65.5 ms, ~915 RPM), so this cannot fire on a shaft that
+ * is still turning fast enough to be measured at all. */
+#define RPM_STALE_MS  200u
 
 /* ---- active config ------------------------------------------------------- */
 static uint16_t s_block_rows;
 static uint32_t s_sample_rate_hz;
 static uint32_t s_imu_rate_hz;
 static uint8_t  s_running  = 0;
-static uint8_t  s_have_imu = 0;
+static uint8_t  s_have_imu  = 0;
+static uint8_t  s_mpu_addr  = MPU6050_ADDR_8;  /* whichever answered */
+static volatile uint32_t s_imu_absent_ticks = 0;
 
 /* ---- deferred reconfig flags (set in ISR apply, drained in service) ------ */
 static volatile uint8_t  s_pending_run_state    = 0xFFu;
@@ -108,6 +129,12 @@ static volatile uint16_t s_pending_block_rows   = 0u;
 /* ---- diagnostic counters (extern in main.c for LED stages) --------------- */
 volatile uint32_t g_adc_cb    = 0;
 volatile uint32_t g_imu_reads = 0;
+/* Absence used to be completely silent: s_have_imu==0 made the TIM2 callback
+ * return without touching any counter, so g_imu_reads and g_imu_errs both sat
+ * at 0 and there was no way to tell "no IMU fitted" from "IMU never polled".
+ * These two make the difference visible.                                    */
+volatile uint32_t g_imu_absent    = 0;   /* polls skipped, no IMU present   */
+volatile uint32_t g_imu_addr_found = 0;  /* 7-bit address, 0 = none         */
 volatile uint32_t g_imu_errs  = 0;
 volatile uint32_t g_rpm_caps  = 0;
 
@@ -263,22 +290,46 @@ static void i2c1_init(void)
 
 static HAL_StatusTypeDef mpu_write(uint8_t reg, uint8_t val)
 {
-    return HAL_I2C_Mem_Write(&s_hi2c1, MPU6050_ADDR_8, reg,
+    return HAL_I2C_Mem_Write(&s_hi2c1, s_mpu_addr, reg,
                              I2C_MEMADD_SIZE_8BIT, &val, 1, 100);
+}
+
+/* Probe both possible addresses and keep the one that answers.
+ *
+ * AD0 low is 0x68 and AD0 high is 0x69, and the old code only ever looked at
+ * 0x68 -- so a board with AD0 tied high, or left floating and reading high, was
+ * reported as "no IMU" forever. Trying both costs one extra probe at startup.
+ *
+ * Returns 1 if an MPU answered and was configured. */
+static uint8_t mpu6050_try_init(void)
+{
+    static const uint8_t addrs[2] = { MPU6050_ADDR_8, MPU6050_ADDR_8_ALT };
+
+    for (unsigned i = 0; i < 2; ++i) {
+        if (HAL_I2C_IsDeviceReady(&s_hi2c1, addrs[i], 2, 50) != HAL_OK)
+            continue;
+
+        s_mpu_addr = addrs[i];
+
+        /* Check the writes. Previously their results were discarded, so a
+         * device that answered the probe but failed to configure -- a wiring
+         * fault appearing under load, say -- looked fully initialised and then
+         * produced nothing. */
+        if (mpu_write(MPU_REG_PWR_MGMT_1, 0x00) != HAL_OK) continue;
+        if (mpu_write(MPU_REG_SMPLRT,     0x00) != HAL_OK) continue;
+        if (mpu_write(MPU_REG_CONFIG,     0x00) != HAL_OK) continue;
+        if (mpu_write(MPU_REG_GYRO_CFG,   0x00) != HAL_OK) continue;
+        if (mpu_write(MPU_REG_ACCEL_CFG,  0x00) != HAL_OK) continue;
+
+        g_imu_addr_found = addrs[i] >> 1;
+        return 1u;
+    }
+    return 0u;
 }
 
 static void mpu6050_init(void)
 {
-    if (HAL_I2C_IsDeviceReady(&s_hi2c1, MPU6050_ADDR_8, 3, 100) != HAL_OK) {
-        s_have_imu = 0;
-        return;
-    }
-    s_have_imu = 1;
-    mpu_write(MPU_REG_PWR_MGMT_1, 0x00);
-    mpu_write(MPU_REG_SMPLRT,     0x00);
-    mpu_write(MPU_REG_CONFIG,     0x00);
-    mpu_write(MPU_REG_GYRO_CFG,   0x00);
-    mpu_write(MPU_REG_ACCEL_CFG,  0x00);
+    s_have_imu = mpu6050_try_init();
 }
 
 static void tim2_program(uint32_t imu_rate_hz)
@@ -359,6 +410,13 @@ static void fill_rows(uint32_t adc_hword_offset)
     int16_t  vz  = s_vib_z;
     uint16_t rpm = s_rpm;
 
+    /* Age out a stale tach reading before it is stamped into another block. */
+    if (s_capture_seen && (HAL_GetTick() - s_rpm_last_ms) > RPM_STALE_MS) {
+        s_rpm          = 0u;
+        s_capture_seen = 0u;
+        rpm            = 0u;
+    }
+
     uint16_t n = s_block_rows;
     for (uint16_t i = 0; i < n; ++i) {
         /* Scan order in the DMA buffer matches the ADC channel ranks 1..N. */
@@ -408,7 +466,17 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance != TIM2) return;
-    if (!s_have_imu) return;
+
+    if (!s_have_imu) {
+        /* Count it, so an absent IMU is visible rather than silent, and retry
+         * occasionally instead of giving up for the lifetime of the board. */
+        g_imu_absent++;
+        if (++s_imu_absent_ticks >= IMU_REPROBE_TICKS) {
+            s_imu_absent_ticks = 0;
+            s_have_imu = mpu6050_try_init();
+        }
+        return;
+    }
     if (HAL_I2C_Mem_Read_IT(&s_hi2c1, MPU6050_ADDR_8,
                             MPU_REG_ACCEL_XOUT_H,
                             I2C_MEMADD_SIZE_8BIT,
@@ -432,6 +500,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
         s_capture_seen = 1u;
     }
     s_last_capture = now;
+    s_rpm_last_ms  = HAL_GetTick();
     g_rpm_caps++;
 }
 
