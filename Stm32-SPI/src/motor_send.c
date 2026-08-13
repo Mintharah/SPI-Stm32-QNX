@@ -301,8 +301,15 @@ static void process_pending_cmd(void)
                           (p->sample_rate_hz < 100u || p->sample_rate_hz > 100000u));
         int bad_imu    = (p->imu_rate_hz != 0u &&
                           (p->imu_rate_hz < 10u || p->imu_rate_hz > 1000u));
+        /* `!=` not `>`. Only ADC is supported, and the old `>` let SOURCE_SYNTH
+         * (0) through this gate -- it is not greater than ADC (1) -- to be
+         * caught by a second check further down, AFTER block_rows, sample_rate,
+         * imu_rate and run_state had already been pushed into the hardware. The
+         * command was then NACK'd, leaving the board reconfigured by a request
+         * it had just told the Pi it rejected. Catching it here restores what
+         * the comment below always claimed: validate everything, then apply. */
         if (p->block_rows == 0u || p->block_rows > MOTOR_MAX_ROWS_PER_BLOCK ||
-            p->source > MOTOR_SOURCE_ADC ||
+            p->source != MOTOR_SOURCE_ADC ||
             p->run_state > MOTOR_RUN_RUN ||
             bad_sample || bad_imu) {
             s_latched_ack_flags = MOTOR_FLAG_ACK_NACK | MOTOR_FLAG_NACK_RANGE;
@@ -337,12 +344,8 @@ static void process_pending_cmd(void)
             motor_acquire_set_run_state((uint8_t)p->run_state);
             any_change = 1;
         }
-        /* source: only ADC is supported in v2. Refuse anything else.        */
-        if (p->source != MOTOR_SOURCE_ADC) {
-            s_latched_ack_flags = MOTOR_FLAG_ACK_NACK | MOTOR_FLAG_NACK_RANGE;
-            g_cmd_nack++;
-            return;
-        }
+        /* (source is validated up front with the other fields, before anything
+         * is applied -- see the range check above.) */
 
         /* Commit to the active-config record AFTER successful apply, so any
          * future diff is against what we actually programmed.                */
@@ -550,6 +553,18 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)
     HAL_SPI_DMAStop(&s_hspi2);
     s_tx_idx = -1;
     s_inflight_blocks = 0;   /* transfer is over; next one starts fresh */
+
+    /* Drop the pending block too. Without this, s_pending survives the error
+     * and the buffer it refers to gets armed later, out of order:
+     *
+     *   A in flight, B assembled and pending -> error kills A, s_tx_idx = -1
+     *   -> next block C sees an idle link, assembles into A's buffer, arms it
+     *   -> C completes, TxRxCplt still sees s_pending == 1 and arms B
+     *
+     * so B goes on the wire after C with a LOWER seq. The Pi reads that as the
+     * stream going backwards. B is already lost the moment the transfer failed;
+     * the next block supersedes it. */
+    s_pending = 0;
 }
 
 /* ---- init ---------------------------------------------------------------- */

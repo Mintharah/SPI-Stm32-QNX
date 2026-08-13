@@ -3,3 +3,6 @@
 
 # Locally built binaries (see firmware/FLASH.txt)
 firmware/
+
+# test binary
+Stm32-SPI/test/t
