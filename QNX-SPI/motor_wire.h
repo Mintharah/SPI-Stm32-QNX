@@ -52,7 +52,7 @@
 #pragma pack(push, 1)
 typedef struct {
     uint16_t current[8]; /* eight ADC1 channels, PA0..PA7 = IN0..IN7 (scan order) */
-    int16_t  vib_x;      /* MPU6050 over I2C, ZOH-held at imu_rate_hz            */
+    int16_t  vib_x;      /* MPU6050 over I2C, read per-row at 1 kHz poll rate   */
     int16_t  vib_y;
     int16_t  vib_z;
     uint16_t rpm;        /* speed, from timer input-capture (tach pulses)        */

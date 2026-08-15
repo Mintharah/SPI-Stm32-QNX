@@ -404,13 +404,8 @@ static void fill_rows(uint32_t adc_hword_offset)
     motor_row_t    *dst = s_row_buf[idx];
     const uint16_t *src = &s_adc_buf[adc_hword_offset];
 
-    /* Snapshot the cached IMU + RPM once per block. ZOH across all rows. */
-    int16_t  vx  = s_vib_x;
-    int16_t  vy  = s_vib_y;
-    int16_t  vz  = s_vib_z;
-    uint16_t rpm = s_rpm;
-
     /* Age out a stale tach reading before it is stamped into another block. */
+    uint16_t rpm = s_rpm;
     if (s_capture_seen && (HAL_GetTick() - s_rpm_last_ms) > RPM_STALE_MS) {
         s_rpm          = 0u;
         s_capture_seen = 0u;
@@ -422,9 +417,15 @@ static void fill_rows(uint32_t adc_hword_offset)
         /* Scan order in the DMA buffer matches the ADC channel ranks 1..N. */
         for (uint32_t c = 0; c < N_CURRENT_CH; ++c)
             dst[i].current[c] = src[i * N_CURRENT_CH + c];
-        dst[i].vib_x   = vx;
-        dst[i].vib_y   = vy;
-        dst[i].vib_z   = vz;
+        /* IMU cache (s_vib_*) is updated by the I2C ISR at imu_rate_hz (max
+         * 1000 Hz). Read it per row so the stream carries the full 1 kHz
+         * vibration signal (staircase: a fresh value every ~20 rows at 20 kHz)
+         * instead of one value per whole block. Both the I2C EV ISR and the
+         * ADC DMA ISR run at NVIC priority 5, so these three reads cannot be
+         * torn by a concurrent cache update. */
+        dst[i].vib_x   = s_vib_x;
+        dst[i].vib_y   = s_vib_y;
+        dst[i].vib_z   = s_vib_z;
         dst[i].rpm     = rpm;
     }
     s_row_idx ^= 1u;
