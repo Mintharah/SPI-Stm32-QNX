@@ -48,4 +48,10 @@ void motor_acquire_set_sample_rate(uint32_t sample_rate_hz);
 void motor_acquire_set_imu_rate(uint32_t imu_rate_hz);
 void motor_acquire_set_run_state(uint8_t run_state);
 
+/* Consumes the ADC-overrun latch: non-zero if one or more ADC conversions
+ * were lost to a DMA overrun since the last call (typically the boundary
+ * scan). Called by the frame assembler so the loss rides the next frame's
+ * flags as MOTOR_FLAG_SAMPLE_OVERRUN. Safe from ISR context.             */
+uint8_t motor_acquire_take_overrun_flag(void);
+
 #endif /* MOTOR_ACQUIRE_H */

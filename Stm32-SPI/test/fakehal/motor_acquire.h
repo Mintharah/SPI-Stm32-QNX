@@ -3,8 +3,10 @@
 #include <stdint.h>
 /* Recording stubs: the tests assert on WHICH of these a SET_CONFIG touched. */
 extern int fa_set_block_rows, fa_set_sample_rate, fa_set_imu_rate, fa_set_run_state;
+extern int fa_overrun_flag;
 void motor_acquire_set_block_rows(uint16_t);
 void motor_acquire_set_sample_rate(uint32_t);
 void motor_acquire_set_imu_rate(uint32_t);
 void motor_acquire_set_run_state(uint8_t);
+uint8_t motor_acquire_take_overrun_flag(void);
 #endif

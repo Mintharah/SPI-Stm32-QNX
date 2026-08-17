@@ -25,7 +25,8 @@
  *   TIM2 update @ imu_rate_hz  ---> HAL_I2C_Mem_Read_IT(MPU6050 ACCEL_X, 6 bytes)
  *                                          |
  *                                          v MemRxCplt
- *                                   s_vib_{x,y,z} (volatile cache, ZOH-read by fill_rows)
+ *                       s_vib_ring_{x,y,z}[VIB_RING_CAP] (ring of IMU polls;
+ *                       fill_rows staircase-maps row i -> poll i / rows-per-poll)
  *
  *   TIM4 CH3 (PB8) input capture, 1 MHz counter ---> period_us between pulses
  *                                                          |
@@ -91,10 +92,18 @@ static motor_row_t s_row_buf[2][MOTOR_MAX_ROWS_PER_BLOCK];
 static volatile uint8_t s_row_idx = 0;
 static uint8_t s_i2c_buf[6];
 
-/* ---- live sensor cache (set by ISRs, read by fill_rows) ------------------ */
-static volatile int16_t  s_vib_x = 0;
-static volatile int16_t  s_vib_y = 0;
-static volatile int16_t  s_vib_z = 0;
+/* ---- live sensor state (set by ISRs, read by fill_rows) ------------------ */
+/* Vibration polls are pushed into a ring by the I2C completion ISR. fill_rows
+ * must not read a single ZOH cache: the I2C EV ISR and the ADC DMA ISR share
+ * NVIC priority 5, so the callback cannot preempt fill_rows and a plain cache
+ * would freeze to one value per whole block. The ring keeps every poll that
+ * arrived during the block (10 @ 1 kHz per 200-row/10 ms block) so fill_rows
+ * can staircase them across the rows. CAP is a power of two (> 10). */
+#define VIB_RING_CAP                32u
+static int16_t   s_vib_ring_x[VIB_RING_CAP];
+static int16_t   s_vib_ring_y[VIB_RING_CAP];
+static int16_t   s_vib_ring_z[VIB_RING_CAP];
+static volatile uint32_t s_vib_count = 0;   /* completed polls (monotonic)   */
 static volatile uint16_t s_rpm   = 0;
 static volatile uint32_t s_last_capture = 0;
 static volatile uint8_t  s_capture_seen = 0;
@@ -137,6 +146,15 @@ volatile uint32_t g_imu_absent    = 0;   /* polls skipped, no IMU present   */
 volatile uint32_t g_imu_addr_found = 0;  /* 7-bit address, 0 = none         */
 volatile uint32_t g_imu_errs  = 0;
 volatile uint32_t g_rpm_caps  = 0;
+
+/* ADC DMA overrun counter. Set when a conversion completed while the DMA had
+ * not yet drained the previous result (OVR latched) -- the DMA was starved of
+ * bus time, typically by the boundary frame-assembly burst. The lost sample
+ * shifts the sampled phase by a fraction of a period, which is exactly the
+ * "drop" visible in the current waveforms at a block boundary. Latched into
+ * the next frame's flags via motor_acquire_take_overrun_flag().             */
+volatile uint32_t g_adc_ovr = 0;
+static volatile uint8_t s_overrun_pending = 0;
 
 /* Dynamic prescaler+ARR search to land a 16-bit (PSC, ARR) pair from Hz. */
 static void compute_psc_arr(uint32_t target_hz, uint32_t *out_psc, uint32_t *out_arr)
@@ -404,6 +422,16 @@ static void fill_rows(uint32_t adc_hword_offset)
     motor_row_t    *dst = s_row_buf[idx];
     const uint16_t *src = &s_adc_buf[adc_hword_offset];
 
+    /* Detect lost conversions before composing the block. OVR latches when a
+     * scan completed but the DMA had not drained the previous result (bus
+     * starvation during the boundary frame-assembly burst). Clear it so the
+     * ADC can resume; the latch rides the next frame's flags. */
+    if (__HAL_ADC_GET_FLAG(&s_hadc1, ADC_FLAG_OVR)) {
+        g_adc_ovr++;
+        s_overrun_pending = 1;
+        __HAL_ADC_CLEAR_FLAG(&s_hadc1, ADC_FLAG_OVR);
+    }
+
     /* Age out a stale tach reading before it is stamped into another block. */
     uint16_t rpm = s_rpm;
     if (s_capture_seen && (HAL_GetTick() - s_rpm_last_ms) > RPM_STALE_MS) {
@@ -413,19 +441,24 @@ static void fill_rows(uint32_t adc_hword_offset)
     }
 
     uint16_t n = s_block_rows;
+    /* Staircase the IMU polls across the block: with the defaults (20 kHz
+     * sample rate, 1 kHz IMU rate, 200 rows) each poll spans exactly 20 rows
+     * (rpp) and each block carries 10 polls (nspb). Row i gets poll
+     * (newest - nspb + 1) + i/rpp from the ring. Reads and writes cannot tear:
+     * the I2C EV ISR and this ADC DMA ISR are both NVIC priority 5. */
+    uint32_t rpp   = (s_sample_rate_hz && s_imu_rate_hz)
+                     ? s_sample_rate_hz / s_imu_rate_hz : 1u;
+    uint32_t nspb  = (n + rpp - 1u) / rpp;
+    uint32_t newest = (s_vib_count >= nspb) ? s_vib_count - 1u : nspb - 1u;
     for (uint16_t i = 0; i < n; ++i) {
         /* Scan order in the DMA buffer matches the ADC channel ranks 1..N. */
         for (uint32_t c = 0; c < N_CURRENT_CH; ++c)
             dst[i].current[c] = src[i * N_CURRENT_CH + c];
-        /* IMU cache (s_vib_*) is updated by the I2C ISR at imu_rate_hz (max
-         * 1000 Hz). Read it per row so the stream carries the full 1 kHz
-         * vibration signal (staircase: a fresh value every ~20 rows at 20 kHz)
-         * instead of one value per whole block. Both the I2C EV ISR and the
-         * ADC DMA ISR run at NVIC priority 5, so these three reads cannot be
-         * torn by a concurrent cache update. */
-        dst[i].vib_x   = s_vib_x;
-        dst[i].vib_y   = s_vib_y;
-        dst[i].vib_z   = s_vib_z;
+        uint32_t ridx = (newest + 1u - nspb + (uint32_t)(i / rpp))
+                        & (VIB_RING_CAP - 1u);
+        dst[i].vib_x   = s_vib_ring_x[ridx];
+        dst[i].vib_y   = s_vib_ring_y[ridx];
+        dst[i].vib_z   = s_vib_ring_z[ridx];
         dst[i].rpm     = rpm;
     }
     s_row_idx ^= 1u;
@@ -452,9 +485,11 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
     if (hi2c->Instance != I2C1) return;
-    s_vib_x = (int16_t)(((uint16_t)s_i2c_buf[0] << 8) | s_i2c_buf[1]);
-    s_vib_y = (int16_t)(((uint16_t)s_i2c_buf[2] << 8) | s_i2c_buf[3]);
-    s_vib_z = (int16_t)(((uint16_t)s_i2c_buf[4] << 8) | s_i2c_buf[5]);
+    uint32_t slot = s_vib_count & (VIB_RING_CAP - 1u);
+    s_vib_ring_x[slot] = (int16_t)(((uint16_t)s_i2c_buf[0] << 8) | s_i2c_buf[1]);
+    s_vib_ring_y[slot] = (int16_t)(((uint16_t)s_i2c_buf[2] << 8) | s_i2c_buf[3]);
+    s_vib_ring_z[slot] = (int16_t)(((uint16_t)s_i2c_buf[4] << 8) | s_i2c_buf[5]);
+    s_vib_count++;
     g_imu_reads++;
 }
 
@@ -595,6 +630,13 @@ void motor_acquire_set_run_state(uint8_t run_state)
 {
     if (run_state > 1u) return;
     s_pending_run_state = run_state;
+}
+
+uint8_t motor_acquire_take_overrun_flag(void)
+{
+    uint8_t f = s_overrun_pending;
+    s_overrun_pending = 0;
+    return f;
 }
 
 void motor_acquire_service(void)

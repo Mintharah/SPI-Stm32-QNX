@@ -72,18 +72,58 @@ static uint16_t s_block_rows = MOTOR_DEFAULT_BLOCK_ROWS;
 static uint16_t s_frame_len  = 0;
 static uint32_t s_seq        = 0;
 
+/* Cumulative ADC samples produced, the frame timebase.
+ *
+ * h->timestamp used to be HAL_GetTick()*1000 -- millisecond resolution on a
+ * block whose real cadence is exactly 10.0 ms. Every block boundary then
+ * snapped to a whole millisecond tick, so the row timestamps the Pi derives
+ * (hdr->timestamp + i*50 us) jumped by 0..1 ms at each block edge even though
+ * every sample was present -- visible as periodic "drops" in a time-axis plot
+ * while every drop counter read 0. Samples are uniform, so the sample count
+ * itself is the timebase: monotonic, continuous, and exact at the boundary. */
+static uint64_t s_sample_idx = 0;
+
 /* The Pi clocks MOTOR_MAX_FRAME_BYTES every transfer (worst-case sizing).
  * We size BOTH the tx frames and the rx buffer to MAX. Only the first
  * s_frame_len bytes are meaningful in tx; everything beyond is whatever
  * the buffer happened to contain (the Pi ignores it anyway, frame size
  * is in the header).                                                       */
-static _Alignas(8) uint8_t s_frame[2][MOTOR_MAX_FRAME_BYTES];
+#ifndef TX_POOL_DEPTH
+#define TX_POOL_DEPTH 4u
+#endif
+
+/* Pending-frame pool. A single pending slot meant that the moment TWO blocks
+ * landed inside one in-flight transfer -- i.e. whenever a Pi read ran a little
+ * past the 10 ms block period -- the second block overwrote the first in the
+ * pending buffer and the older block was silently dropped (s_skipped++), which
+ * the Pi sees as a seq gap ("drops"). The pool keeps the whole backlog the
+ * producer can accumulate while the Pi catches up, so a slow read costs a few
+ * ms of latency, not a frame. A block is discarded only when ALL slots are
+ * occupied (one in flight + TX_POOL_DEPTH-1 queued), i.e. ~40 ms of backlog at
+ * the default 10 ms block cadence -- unreachable with the Pi's ~8.7 ms average
+ * read cycle. 4 slots x 4828 B = 19.3 KB, well within the F401CC's 64 KB.    */
+static _Alignas(8) uint8_t s_frame[TX_POOL_DEPTH][MOTOR_MAX_FRAME_BYTES];
 static _Alignas(8) uint8_t s_rx_dummy[MOTOR_MAX_FRAME_BYTES];
 
-static volatile int s_tx_idx  = -1;
-static volatile int s_pending = 0;
+static volatile int s_tx_idx = -1;   /* slot currently armed/in flight, or -1 */
+
+/* Per-slot state + FIFO of slots that hold a complete, unsent frame. The queue
+ * is drained one frame per SPI exchange in TxRxCplt; the producer appends in
+ * motor_on_block_ready. FIFO order guarantees seq is monotonic on the wire. */
+enum { SLOT_EMPTY = 0, SLOT_READY = 1, SLOT_TX = 2 };
+static uint8_t s_slot_state[TX_POOL_DEPTH];
+static int     s_ready_q[TX_POOL_DEPTH];
+static int     s_ready_head = 0;
+static int     s_ready_cnt  = 0;
+
 static volatile uint32_t s_sent    = 0;
 static volatile uint32_t s_skipped = 0;
+
+/* One-shot latch: a produced block was dropped before it could be sent (pool
+ * full, or arm_tx gave up). Such a block never consumed a seq, so the Pi's
+ * seq check cannot see it -- this latch is the only witness. Surfaced as
+ * MOTOR_FLAG_BLOCK_DROPPED on the next assembled frame. */
+static volatile uint8_t s_block_dropped_pending = 0;
 
 /* ---- command/ACK state --------------------------------------------------- */
 static volatile uint8_t s_cmd_pending = 0;        /* set by TxRxCplt, cleared at block boundary */
@@ -100,7 +140,43 @@ static uint8_t  s_have_last_applied    = 0;
  * against it and skip HAL-touching set functions when nothing has changed. */
 static config_payload_t s_active_config;
 
-/* ---- CRC (table-driven CRC-32/MPEG-2) ------------------------------------ */
+/* ---- CRC-32/MPEG-2 --------------------------------------------------------
+ *
+ * Two implementations of the same algorithm (init 0xFFFFFFFF, poly
+ * 0x04C11DB7, MSB-first, no reflection, no final XOR):
+ *
+ *   MOTOR_CRC_HW (firmware build): the STM32F4 CRC peripheral computes
+ *   exactly CRC-32/MPEG-2. Feeding it 32-bit words packed MSB-first is
+ *   byte-identical to the table version -- both CRC-covered regions are
+ *   multiples of 4 bytes (frame body = 24 + n_rows*24, command body =
+ *   12 + 28), so there is no zero-padding tail to diverge. Using it moves
+ *   the ~530 us of table-driven CRC traffic off the AHB bus, which is the
+ *   boundary glitch: the CRC burst starves the ADC DMA and a conversion
+ *   overruns, shifting the sampled phase by one period. See the comment on
+ *   MOTOR_FLAG_SAMPLE_OVERRUN.
+ *
+ *   Host test build: the table version, cross-checked against a bit-serial
+ *   model of the CRC unit in test_motor_send.c.                                   */
+#if defined(MOTOR_CRC_HW)
+static void crc32_init(void)
+{
+    __HAL_RCC_CRC_CLK_ENABLE();
+    CRC->CR = CRC_CR_RESET;         /* DR := 0xFFFFFFFF (hardwired init) */
+}
+
+static uint32_t crc32_mpeg2(const uint8_t *d, size_t n)
+{
+    CRC->CR = CRC_CR_RESET;
+    size_t i = 0;
+    while (n - i >= 4u) {
+        uint32_t w = ((uint32_t)d[i] << 24) | ((uint32_t)d[i + 1] << 16)
+                   | ((uint32_t)d[i + 2] << 8) |  (uint32_t)d[i + 3];
+        CRC->DR = w;
+        i += 4u;
+    }
+    return CRC->DR;
+}
+#else
 static uint32_t s_crc_table[256];
 
 static void crc32_init(void)
@@ -120,8 +196,19 @@ static uint32_t crc32_mpeg2(const uint8_t *d, size_t n)
         crc = (crc << 8) ^ s_crc_table[((crc >> 24) ^ d[i]) & 0xFFu];
     return crc;
 }
+#endif
 
 /* ---- frame assembly ------------------------------------------------------ */
+
+/* Microseconds per sample. The Pi computes row timestamps as
+ * hdr->timestamp + i * (1,000,000 / sample_rate_hz), so stamping each block at
+ * its first sample makes the derived timestamps continuous across blocks.     */
+static uint64_t sample_interval_us(void)
+{
+    uint32_t rate = s_active_config.sample_rate_hz;
+    return (rate > 0u) ? (1000000ull / rate) : 50ull;
+}
+
 static void assemble_frame(uint8_t *buf, const motor_row_t *rows_in, uint16_t n_rows)
 {
     uint32_t seq = s_seq++;
@@ -129,15 +216,24 @@ static void assemble_frame(uint8_t *buf, const motor_row_t *rows_in, uint16_t n_
     frame_header_t *h = (frame_header_t *)buf;
     h->magic     = MOTOR_FRAME_MAGIC;
     h->seq       = seq;
-    h->timestamp = (uint64_t)HAL_GetTick() * 1000ull;
+    h->timestamp = s_sample_idx * sample_interval_us();
+    s_sample_idx += n_rows;
     h->version   = MOTOR_CONTRACT_VERSION;
     h->n_rows    = n_rows;
 
-    /* ACK bits: latched (sticky until next command) + CONFIG_APPLIED one-shot. */
+    /* ACK bits: latched (sticky until next command) + CONFIG_APPLIED one-shot.
+     * Plus the ADC-overrun latch: a conversion was lost to a DMA overrun since
+     * the last frame, so this block's boundary rows may be phase-shifted. */
     uint16_t f = s_latched_ack_flags;
     if (s_config_applied_latch) {
         f |= MOTOR_FLAG_CONFIG_APPLIED;
         s_config_applied_latch = 0;
+    }
+    if (motor_acquire_take_overrun_flag())
+        f |= MOTOR_FLAG_SAMPLE_OVERRUN;
+    if (s_block_dropped_pending) {
+        f |= MOTOR_FLAG_BLOCK_DROPPED;
+        s_block_dropped_pending = 0;
     }
     h->flags     = f;
     h->_reserved = s_latched_cmd_seq;
@@ -231,6 +327,28 @@ static void arm_tx(int idx)
 
     s_skipped++;
     g_arm_fail++;
+    s_block_dropped_pending = 1;
+}
+
+/* Dequeue the oldest queued block and arm it. If nothing is queued the link
+ * stays idle. On an arm failure the slot's frame was never clocked, so the
+ * slot is freed for reuse. Runs from motor_on_block_ready and TxRxCplt only,
+ * both in the same NVIC priority class as the SPI/DMA ISRs.                */
+static void arm_next_slot(void)
+{
+    if (s_ready_cnt <= 0) { s_tx_idx = -1; return; }
+
+    int slot = s_ready_q[s_ready_head];
+    s_ready_head = (s_ready_head + 1) % TX_POOL_DEPTH;
+    s_ready_cnt--;
+
+    arm_tx(slot);
+
+    if (s_tx_idx == slot) {
+        s_slot_state[slot] = SLOT_TX;
+    } else {
+        s_slot_state[slot] = SLOT_EMPTY;   /* failed to arm; slot is free */
+    }
 }
 
 /* ---- command processing ------------------------------------------------- */
@@ -386,7 +504,7 @@ static void process_pending_cmd(void)
  *   - ErrorCallback cannot fire either -- an abandoned transfer produces no
  *     OVR/FRE, it just sits there.
  *   - s_tx_idx stays >= 0 forever, so every later motor_on_block_ready takes
- *     the `else` branch, sets s_pending and returns.
+ *     the queue path, fills the pool and returns without arming.
  *   - PB0 stays HIGH forever.
  *
  * That is a permanent deadlock, and it survives anything done on the Pi side:
@@ -445,9 +563,12 @@ static void tx_recover(void)
         s_hspi2.Instance->CR1 |=  SPI_CR1_SPE;
     }
 
+    if (s_tx_idx >= 0) s_slot_state[s_tx_idx] = SLOT_EMPTY;
     s_tx_idx          = -1;
-    s_pending         = 0;
     s_inflight_blocks = 0;
+    /* Queued frames were never touched by the aborted transfer; leave them in
+     * s_ready_q. The next motor_on_block_ready re-arms the oldest of them, so
+     * a stalled link recovers without losing the blocks that were waiting.  */
 }
 
 /* ---- the producer hook --------------------------------------------------- */
@@ -464,21 +585,31 @@ void motor_on_block_ready(const motor_row_t *rows, uint16_t n_rows)
         s_inflight_blocks = 0;
     }
 
-    int inflight = s_tx_idx;
-    int build    = (inflight == 0) ? 1 : 0;
-
-    /* Assemble + arm the CURRENT block first, using the CURRENT config.
-     * Then process any pending command, so a SET_CONFIG only takes effect
-     * for the next block. This keeps the in-flight DMA and the frame
+    /* Assemble the CURRENT block using the CURRENT config into a free pool
+     * slot, then queue it. If every slot is already occupied (one in flight +
+     * the backlog) the block is dropped -- the only case where a produced
+     * block is ever lost, and ~40 ms of backlog it cannot realistically
+     * sustain. Then process any pending command, so a SET_CONFIG only takes
+     * effect for the next block. This keeps the in-flight DMA and the frame
      * header consistent.                                                  */
-    assemble_frame(s_frame[build], rows, n_rows);
-
-    if (inflight < 0) {
-        arm_tx(build);
-    } else {
-        if (s_pending) s_skipped++;
-        s_pending = 1;
+    int free_slot = -1;
+    for (unsigned i = 0; i < TX_POOL_DEPTH; ++i) {
+        if (s_slot_state[i] == SLOT_EMPTY) { free_slot = i; break; }
     }
+
+    if (free_slot < 0) {
+        s_skipped++;                        /* pool full: drop the new block */
+        s_block_dropped_pending = 1;
+    } else {
+        assemble_frame(s_frame[free_slot], rows, n_rows);
+        s_slot_state[free_slot] = SLOT_READY;
+        s_ready_q[(s_ready_head + s_ready_cnt) % TX_POOL_DEPTH] = free_slot;
+        s_ready_cnt++;
+    }
+
+    /* If the link is idle, transmit the oldest queued block immediately. */
+    if (s_tx_idx < 0 && s_ready_cnt > 0)
+        arm_next_slot();
 
     if (s_cmd_pending) process_pending_cmd();
 }
@@ -511,6 +642,9 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
 
     int just = s_tx_idx;
 
+    /* The just-completed transfer's slot is free for reuse. */
+    if (just >= 0) s_slot_state[just] = SLOT_EMPTY;
+
     /* Keep the DMAStop. It looks wrong and measures right.
      *
      * This callback is the transfer completing, so stopping the DMA here is
@@ -531,7 +665,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
      */
     HAL_SPI_DMAStop(&s_hspi2);
 
-    /* Re-arm immediately when a block is waiting.
+    /* Re-arm the oldest queued block immediately when one is waiting.
      *
      * Not re-arming was tried, to give the Pi a clean low->high edge per frame
      * instead of a data-ready line that barely dips between transfers. It did
@@ -543,12 +677,10 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
      *
      * Six good blocks a second is a worse trade than seven bad reads, so the
      * re-arm stays. Recorded here so it is not re-attempted blind. */
-    if (s_pending) {
-        s_pending = 0;
-        arm_tx((just == 0) ? 1 : 0);
-    } else {
+    if (s_ready_cnt > 0)
+        arm_next_slot();
+    else
         s_tx_idx = -1;
-    }
 
 }
 
@@ -598,14 +730,14 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)
      *
      * It cannot mask a genuine stall: a transfer that really is wedged stops
      * completing, and the TX_STALL_BLOCKS watchdog in motor_on_block_ready
-     * tears it down and re-arms within about a second. */
+* tears it down and re-arms within about a second. */
     /* Nothing in flight, so there is nothing to recover -- and acting anyway
-     * does harm. The teardown below clears s_pending, so a stale error landing
-     * between transfers silently discards the block that was queued for the
-     * next one, and drops data-ready after the completion path has raised it.
-     * If the master has already sampled that line high it then clocks into a
-     * slave with no DMA armed, which is the OVR in the counters and the bad
-     * magic at the Pi.
+     * does harm. The teardown below clears the in-flight slot, so a stale
+     * error landing between transfers discards nothing (queued blocks are in
+     * their own slots), but it does drop data-ready after the completion path
+     * has raised it. If the master has already sampled that line high it then
+     * clocks into a slave with no DMA armed, which is the OVR in the counters
+     * and the bad magic at the Pi.
      *
      * These are counted separately so the split is visible rather than
      * assumed: g_err_idle vs g_err_live. */
@@ -623,22 +755,19 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)
      * which wastes the controller's time and causes the next valid frame
      * to be skipped, inflating the drop count.  Instead, let the
      * completion callback or the next capture-completion handle re-arm
-     * naturally via the normal s_tx_idx / s_pending state machine.       */
+     * naturally via the normal s_tx_idx / s_ready_q state machine.       */
     HAL_SPI_DMAStop(&s_hspi2);
+    if (s_tx_idx >= 0) s_slot_state[s_tx_idx] = SLOT_EMPTY;
     s_tx_idx = -1;
     s_inflight_blocks = 0;   /* transfer is over; next one starts fresh */
 
-    /* Drop the pending block too. Without this, s_pending survives the error
-     * and the buffer it refers to gets armed later, out of order:
-     *
-     *   A in flight, B assembled and pending -> error kills A, s_tx_idx = -1
-     *   -> next block C sees an idle link, assembles into A's buffer, arms it
-     *   -> C completes, TxRxCplt still sees s_pending == 1 and arms B
-     *
-     * so B goes on the wire after C with a LOWER seq. The Pi reads that as the
-     * stream going backwards. B is already lost the moment the transfer failed;
-     * the next block supersedes it. */
-    s_pending = 0;
+    /* Queued blocks survive an error. The old single-slot design had to drop
+     * the pending block because re-arming it later, after a NEWER block had
+     * been assembled into the same buffer, sent an old seq out of order. The
+     * pool keeps each queued frame in its own slot, and the FIFO arms them in
+     * seq order, so "B after C with a lower seq" is impossible -- the oldest
+     * queued frame is always armed first. Only the frame on the failed
+     * transfer itself is lost. */
 }
 
 /* ---- init ---------------------------------------------------------------- */
@@ -726,6 +855,7 @@ void motor_send_init(uint16_t block_rows)
     s_block_rows = block_rows;
     s_frame_len  = (uint16_t)(sizeof(frame_header_t)
                  + (size_t)block_rows * sizeof(motor_row_t) + sizeof(frame_crc_t));
+    s_sample_idx = 0;
 
     /* Seed s_active_config with what motor_synth_init / motor_send_init will
      * actually have programmed. Must match the synth-side defaults in
